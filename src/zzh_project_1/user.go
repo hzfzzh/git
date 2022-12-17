@@ -1,0 +1,132 @@
+package main
+
+import (
+	"net"
+	"strings"
+)
+
+type User struct {
+	Name string      //用户名称
+	Addr string      //用户地址ip
+	C    chan string //管道channel，绑定用户的channel
+	conn net.Conn    //当前用户和客户端连接的唯一标志
+
+	server *Server //zzh222当前用户属于哪个server，是为了当前用户类能访问到Server里的属性
+}
+
+// 创建一个用户的API，方法，接口
+func NewUser(conn net.Conn, server *Server) *User { //zzh333这里就需要新增形参*Server把当前Server属性给传进来
+
+	userAddr := conn.RemoteAddr().String() //从当前connection的remote连接中拿到地址，作为用户名称
+
+	user := &User{
+		Name: userAddr,
+		Addr: userAddr,
+		C:    make(chan string),
+		conn: conn,
+
+		server: server, //zzh444当前user的server就等于你传进来的server
+	}
+
+	//启动监听当前user channel消息的goroutine
+	//每次new一个user都会携带一个go程，一直监听当前user的channel
+	go user.ListenMessage()
+
+	return user
+}
+
+// 用户的上线业务
+// zzh111这里从server.go把用户上线的代码复制过来之后，明显这个this用户类是无法访问到server的map的，因此咱们需要给user结构体新增一个其所属server的属性
+func (this *User) Online() {
+	//用户上线，将消息广播,将用户加入到onlineMap中
+	this.server.mapLock.Lock()              //先上锁	//zzh666做完前5步后，我们就能在当前user中访问当前user的map属性了
+	this.server.OnlineMap[this.Name] = this //zzh6.5 user改成this，换个新名字
+	this.server.mapLock.Unlock()            //后解锁，这是个常见的加解锁
+
+	//广播当前用户上线消息
+	this.server.BroadCast(this, "one user is onlineing已上线") //zzh777,把user改成this，因为上面的加解锁操作里把用户名赋值给this了
+}
+
+// 用户的下线业务
+func (this *User) Offline() {
+	//zzh888,把上面的上线代码直接全部拷贝到这里并做修改。
+	//用户下线，将消息广播,将用户从onlineMap中删除
+	this.server.mapLock.Lock() //先上锁	//zzh666做完前5步后，我们就能在当前user中访问当前user的map属性了
+	delete(this.server.OnlineMap, this.Name)
+	this.server.mapLock.Unlock() //后解锁，这是个常见的加解锁
+
+	//广播当前用户上线消息
+	this.server.BroadCast(this, "one user is offline已下线") //zzh777,把user改成this，因为上面的加解锁操作里把用户名赋值给this了
+
+}
+
+// 给当前User对应的客户端发送消息，非广播
+func (this *User) SendMsg(msg string) {
+	this.conn.Write([]byte(msg))
+}
+
+// 用户处理消息的业务
+func (this *User) DoMessage(msg string) {
+	if msg == "who" {
+		//查询当前在线用户都有哪些
+		this.server.mapLock.Lock()
+		for _, user := range this.server.OnlineMap { //这个user是当前在线user
+			onlineMsg := "[" + user.Addr + "]" + user.Name + ":" + "is online在线\n"
+			this.SendMsg(onlineMsg)
+		}
+		this.server.mapLock.Unlock()
+	} else if len(msg) > 7 && msg[:7] == "rename|" {
+		//消息格式： rename|张三
+		newName := strings.Split(msg, "|")[1] //自带方法根据某个字符截取，后取第一个元素
+		//判断name是否存在
+		_, ok := this.server.OnlineMap[newName]
+		if ok {
+			this.SendMsg("rename uses name has been used当前用户名已使用")
+		} else {
+			this.server.mapLock.Lock()
+			delete(this.server.OnlineMap, this.Name)
+			this.server.OnlineMap[newName] = this
+			this.server.mapLock.Unlock()
+
+			this.Name = newName
+			this.SendMsg("your user name renamed已修改")
+		}
+
+	} else if len(msg) > 4 && msg[:3] == "to|" {
+		//消息格式：to|张三|消息内容
+		//1 获取对方的用户名
+		remoteName := strings.Split(msg, "|")[1]
+		if remoteName == "" {
+			this.SendMsg("消息格式不正确，请使用\"to|张三|你好\"格式。\n")
+			return
+		}
+		//2 根据用户名，得到对方User对象
+		remoteUser, ok := this.server.OnlineMap[remoteName]
+		if !ok {
+			this.SendMsg("该用户名不存在\n")
+			return
+		}
+		//3 获取消息内容，通过对方的User对象将消息发送过去
+		content := strings.Split(msg, "|")[2]
+		if content == "" {
+			this.SendMsg("无消息内容，请重发\n") //这个是给当前发消息的一个提示
+			return
+		} else {
+			remoteUser.SendMsg(this.Name + "对您说" + content) //这个是给被发的人的具体消息，是用remoteUser调用的SendMsg
+		}
+
+	} else { // 处理完who之后在正常处理广播消息
+		//zzh999 目前用户处理的业务就广播一条
+		//zzh101010做完这些之后，就可以在server.go中删除原来的代码了
+		this.server.BroadCast(this, msg)
+	}
+}
+
+// 监听当前User channel的方法，一旦有消息，就直接发送给对端客户端
+func (this *User) ListenMessage() {
+	for {
+		msg := <-this.C //msg永远从user的管道里面去读，一旦有，就给它，否则就阻塞
+
+		this.conn.Write([]byte(msg + "\n")) //这里和server.go里面的conn.Read(buf)功能相对应
+	}
+}
